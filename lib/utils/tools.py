@@ -59,7 +59,7 @@ def ensure_dir(path):
     :param paths: path
     :return:
     """
-    if not os.path.exists(path):
+    if path is not None and path != '' and not os.path.exists(path):
         os.makedirs(path)
         
 def read_pkl(data_url):
