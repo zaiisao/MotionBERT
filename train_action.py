@@ -24,6 +24,7 @@ from lib.data.dataset_action import NTURGBD
 from lib.model.model_action import ActionNet
 from lib.model.attention_mil import AttentionMIL
 from lib.model.ordinal import OrdinalHead, OrdinalCrossEntropyLoss, labels_to_ordinal
+from lib.model.fusion_utils import align_lma_to_sequence
 
 _wham_available = False
 process_single_video = None
@@ -179,7 +180,7 @@ def validate(test_loader, model, criterion, attention_mil, ordinal_head, num_tie
             B, M, T, J, C = mb_feat.shape
             mb_feat = mb_feat.reshape(B, M * T * J, C)  # (B, S, C)
             lma_feat = _extract_lma_feature_batch(batch_video, opts, device)
-            lma_feat = lma_feat.unsqueeze(1).expand(-1, mb_feat.shape[1], -1)  # (B, S, L)
+            lma_feat = align_lma_to_sequence(lma_feat, mb_feat.shape[1])
             fusion_feat = torch.cat([mb_feat, lma_feat], dim=-1)  # (B, S, C+L)
             bag_feat = attention_mil(fusion_feat)
             ordinal_probs = ordinal_head(bag_feat)
@@ -333,7 +334,7 @@ def train_with_config(args, opts):
                 B, M, T, J, C = mb_feat.shape
                 mb_feat = mb_feat.reshape(B, M * T * J, C)  # (B, S, C)
                 lma_feat = _extract_lma_feature_batch(batch_video, opts, device)
-                lma_feat = lma_feat.unsqueeze(1).expand(-1, mb_feat.shape[1], -1)  # (B, S, L)
+                lma_feat = align_lma_to_sequence(lma_feat, mb_feat.shape[1])
                 fusion_feat = torch.cat([mb_feat, lma_feat], dim=-1)  # (B, S, C+L)
                 bag_feat = attention_mil(fusion_feat)
                 ordinal_probs = ordinal_head(bag_feat)

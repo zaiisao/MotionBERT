@@ -10,6 +10,9 @@ class AttentionMIL(nn.Module):
         self.attn_dim = attn_dim
         self.attention_branches = attention_branches
 
+        self.temporal_conv = nn.Conv1d(self.in_dim, self.in_dim, kernel_size=3, padding=1, bias=True)
+        self.temporal_norm = nn.LayerNorm(self.in_dim)
+
         self.attention_V = nn.Sequential(
             nn.Linear(self.in_dim, self.attn_dim),
             nn.Tanh()
@@ -28,6 +31,9 @@ class AttentionMIL(nn.Module):
             Output:
                 bag_repr: (B, D) if attention_branches==1 else (B, K*D)
         '''
+        x = x + self.temporal_conv(x.transpose(1, 2)).transpose(1, 2)
+        x = self.temporal_norm(x)
+
         A_V = self.attention_V(x)                      # (B, N, L)
         A_U = self.attention_U(x)                      # (B, N, L)
         A = self.attention_w(A_V * A_U)               # (B, N, K)
