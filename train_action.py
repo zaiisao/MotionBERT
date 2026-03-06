@@ -23,6 +23,7 @@ from lib.model.loss import *
 from lib.data.dataset_action import NTURGBD
 from lib.model.model_action import ActionNet
 from lib.model.attention_mil import AttentionMIL
+from lib.model.ordinal import OrdinalHead, OrdinalCrossEntropyLoss, labels_to_ordinal
 
 _wham_available = False
 process_single_video = None
@@ -139,10 +140,26 @@ def _extract_lma_feature_batch(batch_video, opts, device):
     lma_tensor = torch.from_numpy(np.stack(batch_vec, axis=0)).to(device=device)
     return lma_tensor
 
-def validate(test_loader, model, criterion, attention_mil, fusion_head, opts):
+def _ordinal_to_class_probs(ordinal_probs):
+    '''
+        ordinal_probs: (B, K-1), p(y > k)
+        class_probs: (B, K)
+    '''
+    B, K_minus_1 = ordinal_probs.shape
+    K = K_minus_1 + 1
+    class_probs = ordinal_probs.new_zeros((B, K))
+    class_probs[:, 0] = 1.0 - ordinal_probs[:, 0]
+    if K > 2:
+        class_probs[:, 1:-1] = ordinal_probs[:, :-1] - ordinal_probs[:, 1:]
+    class_probs[:, -1] = ordinal_probs[:, -1]
+    class_probs = torch.clamp(class_probs, min=0.0)
+    class_probs = class_probs / (class_probs.sum(dim=1, keepdim=True) + 1e-8)
+    return class_probs
+
+def validate(test_loader, model, criterion, attention_mil, ordinal_head, num_tiers, opts):
     model.eval()
     attention_mil.eval()
-    fusion_head.eval()
+    ordinal_head.eval()
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -165,12 +182,17 @@ def validate(test_loader, model, criterion, attention_mil, fusion_head, opts):
             lma_feat = lma_feat.unsqueeze(1).expand(-1, mb_feat.shape[1], -1)  # (B, S, L)
             fusion_feat = torch.cat([mb_feat, lma_feat], dim=-1)  # (B, S, C+L)
             bag_feat = attention_mil(fusion_feat)
-            output = fusion_head(bag_feat)
-            loss = criterion(output, batch_gt)
+            ordinal_probs = ordinal_head(bag_feat)
+            ordinal_targets = labels_to_ordinal(batch_gt.long(), num_tiers=num_tiers)
+            loss = criterion(ordinal_probs, ordinal_targets)
+            output = _ordinal_to_class_probs(ordinal_probs)
 
             # update metric
             losses.update(loss.item(), batch_size)
-            acc1, acc5 = accuracy(output, batch_gt, topk=(1, 5))
+            max_topk = min(5, output.shape[1])
+            accs = accuracy(output, batch_gt, topk=(1, max_topk))
+            acc1 = accs[0]
+            acc5 = accs[1] if len(accs) > 1 else accs[0]
             top1.update(acc1[0], batch_size)
             top5.update(acc5[0], batch_size)
 
@@ -212,14 +234,13 @@ def train_with_config(args, opts):
     fused_dim = args.dim_rep + opts.lma_feature_dim
     attention_mil = AttentionMIL(in_dim=fused_dim, attn_dim=opts.mil_attn_dim, attention_branches=opts.mil_branches)
     mil_out_dim = fused_dim * opts.mil_branches
-    fusion_head = nn.Linear(mil_out_dim, args.action_classes)
-    criterion = torch.nn.CrossEntropyLoss()
+    ordinal_head = OrdinalHead(in_dim=mil_out_dim, num_tiers=args.action_classes)
+    criterion = OrdinalCrossEntropyLoss(num_tiers=args.action_classes)
     if torch.cuda.is_available():
         model = nn.DataParallel(model)
         model = model.cuda()
         attention_mil = attention_mil.cuda()
-        fusion_head = fusion_head.cuda()
-        criterion = criterion.cuda() 
+        ordinal_head = ordinal_head.cuda()
     best_acc = 0
     model_params = 0
     for parameter in model.parameters():
@@ -259,15 +280,17 @@ def train_with_config(args, opts):
         model.load_state_dict(checkpoint['model'], strict=True)
         if 'attention_mil' in checkpoint and checkpoint['attention_mil'] is not None:
             attention_mil.load_state_dict(checkpoint['attention_mil'], strict=True)
-        if 'fusion_head' in checkpoint and checkpoint['fusion_head'] is not None:
-            fusion_head.load_state_dict(checkpoint['fusion_head'], strict=True)
+        if 'ordinal_head' in checkpoint and checkpoint['ordinal_head'] is not None:
+            ordinal_head.load_state_dict(checkpoint['ordinal_head'], strict=True)
+        elif 'fusion_head' in checkpoint and checkpoint['fusion_head'] is not None:
+            print('WARNING: Found fusion_head in checkpoint. Skipping load because current run expects ordinal_head.')
     
     if not opts.evaluate:
         optimizer = optim.AdamW(
             [     {"params": filter(lambda p: p.requires_grad, model.module.backbone.parameters()), "lr": args.lr_backbone},
                   {"params": filter(lambda p: p.requires_grad, model.module.head.parameters()), "lr": args.lr_head},
                                 {"params": filter(lambda p: p.requires_grad, attention_mil.parameters()), "lr": args.lr_head},
-                {"params": filter(lambda p: p.requires_grad, fusion_head.parameters()), "lr": args.lr_head},
+                {"params": filter(lambda p: p.requires_grad, ordinal_head.parameters()), "lr": args.lr_head},
             ],      lr=args.lr_backbone, 
                     weight_decay=args.weight_decay
         )
@@ -313,11 +336,16 @@ def train_with_config(args, opts):
                 lma_feat = lma_feat.unsqueeze(1).expand(-1, mb_feat.shape[1], -1)  # (B, S, L)
                 fusion_feat = torch.cat([mb_feat, lma_feat], dim=-1)  # (B, S, C+L)
                 bag_feat = attention_mil(fusion_feat)
-                output = fusion_head(bag_feat)
+                ordinal_probs = ordinal_head(bag_feat)
+                ordinal_targets = labels_to_ordinal(batch_gt.long(), num_tiers=args.action_classes)
+                output = _ordinal_to_class_probs(ordinal_probs)
                 optimizer.zero_grad()
-                loss_train = criterion(output, batch_gt)
+                loss_train = criterion(ordinal_probs, ordinal_targets)
                 losses_train.update(loss_train.item(), batch_size)
-                acc1, acc5 = accuracy(output, batch_gt, topk=(1, 5))
+                max_topk = min(5, output.shape[1])
+                accs = accuracy(output, batch_gt, topk=(1, max_topk))
+                acc1 = accs[0]
+                acc5 = accs[1] if len(accs) > 1 else accs[0]
                 top1.update(acc1[0], batch_size)
                 top5.update(acc5[0], batch_size)
                 loss_train.backward()
@@ -334,7 +362,7 @@ def train_with_config(args, opts):
                        data_time=data_time, loss=losses_train, top1=top1))
                 sys.stdout.flush()
                 
-            test_loss, test_top1, test_top5 = validate(test_loader, model, criterion, attention_mil, fusion_head, opts)
+            test_loss, test_top1, test_top5 = validate(test_loader, model, criterion, attention_mil, ordinal_head, args.action_classes, opts)
                 
             train_writer.add_scalar('train_loss', losses_train.avg, epoch + 1)
             train_writer.add_scalar('train_top1', top1.avg, epoch + 1)
@@ -354,7 +382,7 @@ def train_with_config(args, opts):
                 'optimizer': optimizer.state_dict(),
                 'model': model.state_dict(),
                 'attention_mil': attention_mil.state_dict(),
-                'fusion_head': fusion_head.state_dict(),
+                'ordinal_head': ordinal_head.state_dict(),
                 'best_acc' : best_acc
             }, chk_path)
 
@@ -369,12 +397,12 @@ def train_with_config(args, opts):
                 'optimizer': optimizer.state_dict(),
                 'model': model.state_dict(),
                 'attention_mil': attention_mil.state_dict(),
-                'fusion_head': fusion_head.state_dict(),
+                'ordinal_head': ordinal_head.state_dict(),
                 'best_acc' : best_acc
                 }, best_chk_path)
 
     if opts.evaluate:
-        test_loss, test_top1, test_top5 = validate(test_loader, model, criterion, attention_mil, fusion_head, opts)
+        test_loss, test_top1, test_top5 = validate(test_loader, model, criterion, attention_mil, ordinal_head, args.action_classes, opts)
         print('Loss {loss:.4f} \t'
               'Acc@1 {top1:.3f} \t'
               'Acc@5 {top5:.3f} \t'.format(loss=test_loss, top1=test_top1, top5=test_top5))
