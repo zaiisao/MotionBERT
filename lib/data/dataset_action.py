@@ -142,6 +142,7 @@ class ActionDataset(Dataset):
         self.scale_range = scale_range
         motions = []
         labels = []
+        video_infos = []
         for sample in annotations:
             if check_split and (not sample['frame_dir'] in self.split):
                 continue
@@ -156,8 +157,14 @@ class ActionDataset(Dataset):
                 motion = np.concatenate((motion, fake), axis=0)
             motions.append(motion.astype(np.float32)) 
             labels.append(sample['label'])
+            video_infos.append({
+                'frame_dir': sample.get('frame_dir', ''),
+                'filename': sample.get('filename', ''),
+                'video_path': sample.get('video_path', sample.get('filename', sample.get('frame_dir', '')))
+            })
         self.motions = np.array(motions)
         self.labels = np.array(labels)
+        self.video_infos = video_infos
         
     def __len__(self):
         'Denotes the total number of samples'
@@ -173,13 +180,14 @@ class NTURGBD(ActionDataset):
     def __getitem__(self, idx):
         'Generates one sample of data'
         motion, label = self.motions[idx], self.labels[idx] # (M,T,J,C)
+        video_info = self.video_infos[idx]
         if self.random_move:
             motion = random_move(motion)
         if self.scale_range:
             result = crop_scale(motion, scale_range=self.scale_range)
         else:
             result = motion
-        return result.astype(np.float32), label
+        return result.astype(np.float32), label, video_info
     
 class NTURGBD1Shot(ActionDataset):
     def __init__(self, data_path, data_split, n_frames=243, random_move=True, scale_range=[1,1], check_split=False):
@@ -197,10 +205,11 @@ class NTURGBD1Shot(ActionDataset):
     def __getitem__(self, idx):
         'Generates one sample of data'
         motion, label = self.motions[idx], self.labels[idx] # (M,T,J,C)
+        video_info = self.video_infos[idx]
         if self.random_move:
             motion = random_move(motion)
         if self.scale_range:
             result = crop_scale(motion, scale_range=self.scale_range)
         else:
             result = motion
-        return result.astype(np.float32), label
+        return result.astype(np.float32), label, video_info
