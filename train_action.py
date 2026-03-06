@@ -21,21 +21,11 @@ from lib.utils.tools import *
 from lib.utils.learning import *
 from lib.model.loss import *
 from lib.data.dataset_action import NTURGBD
+from lib.data.dataset_precomputed import PrecomputedWHAMFolderDataset
 from lib.model.model_action import ActionNet
 from lib.model.attention_mil import AttentionMIL
 from lib.model.ordinal import OrdinalHead, OrdinalCrossEntropyLoss, labels_to_ordinal
 from lib.model.fusion_utils import align_lma_to_sequence
-
-_wham_available = False
-process_single_video = None
-_kg_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-if _kg_root not in sys.path:
-    sys.path.insert(0, _kg_root)
-try:
-    from core.wham_inference import process_single_video
-    _wham_available = True
-except Exception:
-    _wham_available = False
 
 random.seed(0)
 np.random.seed(0)
@@ -50,9 +40,11 @@ def parse_args():
     parser.add_argument('-e', '--evaluate', default='', type=str, metavar='FILENAME', help='checkpoint to evaluate (file name)')
     parser.add_argument('-freq', '--print_freq', default=100)
     parser.add_argument('-ms', '--selection', default='latest_epoch.bin', type=str, metavar='FILENAME', help='checkpoint to finetune (file name)')
-    parser.add_argument('--video_root', default='', type=str, help='Optional root directory for raw videos.')
-    parser.add_argument('--lma_cache_dir', default='output/wham_kineguard', type=str, help='Directory with WHAM/LMA outputs.')
-    parser.add_argument('--run_wham_online', action='store_true', help='Run WHAM+LMA online if cached LMA is missing.')
+    parser.add_argument('--data_source', default='pkl', choices=['pkl', 'precomputed'], help='Dataset source type.')
+    parser.add_argument('--dataset_registry', default='configs/action/dataset_registry.json', type=str, help='Dataset registry JSON for precomputed source.')
+    parser.add_argument('--dataset_keys', default='npdi_tier3', type=str, help='Comma-separated dataset keys from registry.')
+    parser.add_argument('--datasets_root', default='', type=str, help='Root directory that contains dataset feature folders referenced by registry.')
+    parser.add_argument('--lma_cache_dir', default='output/wham_kineguard', type=str, help='Directory with precomputed WHAM/LMA outputs.')
     parser.add_argument('--lma_feature_dim', default=128, type=int, help='Target LMA feature dimension for fusion.')
     parser.add_argument('--mil_attn_dim', default=128, type=int, help='Attention hidden dimension for AttentionMIL.')
     parser.add_argument('--mil_branches', default=1, type=int, help='Number of MIL attention branches.')
@@ -80,7 +72,7 @@ def _load_single_lma_feature(lma_file, target_dim):
         return _to_fixed_dim(vec, target_dim)
     return np.zeros((target_dim,), dtype=np.float32)
 
-def _resolve_video_path(video_info, video_root=''):
+def _resolve_feature_key(video_info):
     candidates = []
     if isinstance(video_info, dict):
         for key in ['video_path', 'filename', 'frame_dir']:
@@ -90,15 +82,13 @@ def _resolve_video_path(video_info, video_root=''):
     elif isinstance(video_info, str):
         candidates.append(video_info)
 
-    exts = ['', '.mp4', '.avi', '.mov', '.mkv']
     for c in candidates:
-        if os.path.isfile(c):
-            return c
-        if video_root:
-            for ext in exts:
-                cand = os.path.join(video_root, c + ext)
-                if os.path.isfile(cand):
-                    return cand
+        c = c.strip()
+        if not c:
+            continue
+        base = os.path.basename(c)
+        if base:
+            return os.path.splitext(base)[0]
     return ''
 
 def _extract_lma_feature_batch(batch_video, opts, device):
@@ -114,28 +104,39 @@ def _extract_lma_feature_batch(batch_video, opts, device):
     batch_vec = []
     os.makedirs(opts.lma_cache_dir, exist_ok=True)
     for video_info in video_infos:
-        video_path = _resolve_video_path(video_info, opts.video_root)
-        if video_path:
-            video_name = os.path.splitext(os.path.basename(video_path))[0]
-            sample_dir = os.path.join(opts.lma_cache_dir, video_name)
-            lma_files = sorted(glob.glob(os.path.join(sample_dir, 'lma_features_id*.npy')))
-        else:
-            lma_files = []
+        feature_key = _resolve_feature_key(video_info)
+        if not feature_key:
+            raise ValueError(f'Cannot resolve feature key from video_info={video_info}')
 
-        if len(lma_files) == 0 and opts.run_wham_online and _wham_available and process_single_video is not None and video_path:
+        sample_dir = os.path.join(opts.lma_cache_dir, feature_key)
+        fragment_id = None
+        if isinstance(video_info, dict) and 'fragment_id' in video_info:
+            fragment_val = video_info['fragment_id']
+            if isinstance(fragment_val, (list, tuple, np.ndarray)):
+                fragment_val = fragment_val[0]
+            if hasattr(fragment_val, 'item'):
+                fragment_val = fragment_val.item()
             try:
-                process_single_video(video_path=video_path, output_root=opts.lma_cache_dir, visualize=False)
-                video_name = os.path.splitext(os.path.basename(video_path))[0]
-                sample_dir = os.path.join(opts.lma_cache_dir, video_name)
-                lma_files = sorted(glob.glob(os.path.join(sample_dir, 'lma_features_id*.npy')))
+                fragment_id = int(fragment_val)
             except Exception:
-                lma_files = []
+                fragment_id = None
 
-        if len(lma_files) > 0:
+        if fragment_id is not None:
+            lma_file = os.path.join(sample_dir, f'lma_features_id{fragment_id}.npy')
+            if not os.path.exists(lma_file):
+                raise FileNotFoundError(
+                    f'Missing fragment-specific LMA file: {lma_file} for key={feature_key}, fragment_id={fragment_id}'
+                )
+            lma_vec = _load_single_lma_feature(lma_file, opts.lma_feature_dim)
+        else:
+            lma_files = sorted(glob.glob(os.path.join(sample_dir, 'lma_features_id*.npy')))
+            if len(lma_files) == 0:
+                raise FileNotFoundError(
+                    f'No precomputed LMA files found for key={feature_key} in {sample_dir}. '
+                    f'Expected files matching lma_features_id*.npy'
+                )
             vectors = [_load_single_lma_feature(f, opts.lma_feature_dim) for f in lma_files]
             lma_vec = np.mean(np.stack(vectors, axis=0), axis=0)
-        else:
-            lma_vec = np.zeros((opts.lma_feature_dim,), dtype=np.float32)
         batch_vec.append(lma_vec)
 
     lma_tensor = torch.from_numpy(np.stack(batch_vec, axis=0)).to(device=device)
@@ -264,9 +265,31 @@ def train_with_config(args, opts):
           'prefetch_factor': 4,
           'persistent_workers': True
     }
-    data_path = 'data/action/%s.pkl' % args.dataset
-    ntu60_xsub_train = NTURGBD(data_path=data_path, data_split=args.data_split+'_train', n_frames=args.clip_len, random_move=args.random_move, scale_range=args.scale_range_train)
-    ntu60_xsub_val = NTURGBD(data_path=data_path, data_split=args.data_split+'_val', n_frames=args.clip_len, random_move=False, scale_range=args.scale_range_test)
+    if opts.data_source == 'precomputed':
+        ntu60_xsub_train = PrecomputedWHAMFolderDataset(
+            registry_path=opts.dataset_registry,
+            dataset_keys=opts.dataset_keys,
+            data_split='train',
+            datasets_root=opts.datasets_root,
+            n_frames=args.clip_len,
+            random_move=False,
+            scale_range=args.scale_range_train,
+            num_joints=args.num_joints,
+        )
+        ntu60_xsub_val = PrecomputedWHAMFolderDataset(
+            registry_path=opts.dataset_registry,
+            dataset_keys=opts.dataset_keys,
+            data_split='val',
+            datasets_root=opts.datasets_root,
+            n_frames=args.clip_len,
+            random_move=False,
+            scale_range=args.scale_range_test,
+            num_joints=args.num_joints,
+        )
+    else:
+        data_path = 'data/action/%s.pkl' % args.dataset
+        ntu60_xsub_train = NTURGBD(data_path=data_path, data_split=args.data_split+'_train', n_frames=args.clip_len, random_move=args.random_move, scale_range=args.scale_range_train)
+        ntu60_xsub_val = NTURGBD(data_path=data_path, data_split=args.data_split+'_val', n_frames=args.clip_len, random_move=False, scale_range=args.scale_range_test)
 
     train_loader = DataLoader(ntu60_xsub_train, **trainloader_params)
     test_loader = DataLoader(ntu60_xsub_val, **testloader_params)

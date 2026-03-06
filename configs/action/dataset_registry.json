@@ -1,0 +1,16 @@
+{
+  "global_seed": 42,
+  "datasets": {
+    "npdi_tier3": {
+      "features_root": "NPDI_features",
+      "label_tier": 3,
+      "include_failed": false,
+      "split_seed": 42,
+      "split_ratios": {
+        "train": 0.8,
+        "val": 0.1,
+        "test": 0.1
+      }
+    }
+  }
+}
