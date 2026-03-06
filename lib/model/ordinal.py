@@ -46,6 +46,7 @@ class OrdinalCrossEntropyLoss(nn.Module):
             probs: (B, K-1), sigmoid outputs from OrdinalHead
             ordinal_targets: (B, K-1), cumulative binary targets
         '''
+        probs = torch.nan_to_num(probs, nan=0.5, posinf=1.0 - self.eps, neginf=self.eps)
         probs = torch.clamp(probs, min=self.eps, max=1.0 - self.eps)
         bce = F.binary_cross_entropy(probs, ordinal_targets, reduction='none')
 

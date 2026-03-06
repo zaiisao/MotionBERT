@@ -55,6 +55,17 @@ class TestOrdinal(unittest.TestCase):
         self.assertLessEqual((penalized_ok - base_ok).item(), 1e-6)
         self.assertGreater((penalized_bad - base_bad).item(), 0.0)
 
+    def test_loss_handles_nan_inf_probs(self):
+        loss_fn = OrdinalCrossEntropyLoss(num_tiers=4, monotonic_weight=0.0)
+        targets = torch.tensor([2, 1])
+        ord_targets = labels_to_ordinal(targets, num_tiers=4)
+        probs = torch.tensor(
+            [[float('nan'), float('inf'), float('-inf')], [0.9, 0.1, 0.05]],
+            dtype=torch.float32,
+        )
+        loss = loss_fn(probs, ord_targets)
+        self.assertTrue(torch.isfinite(loss).item())
+
 
 if __name__ == '__main__':
     unittest.main()

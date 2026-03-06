@@ -186,6 +186,10 @@ def validate(test_loader, model, criterion, attention_mil, ordinal_head, num_tie
             bag_feat = attention_mil(fusion_feat)
             ordinal_probs = ordinal_head(bag_feat)
             ordinal_targets = labels_to_ordinal(batch_gt.long(), num_tiers=num_tiers)
+            ordinal_probs = torch.nan_to_num(ordinal_probs, nan=0.5, posinf=1.0, neginf=0.0)
+            ordinal_probs = torch.clamp(ordinal_probs, min=0.0, max=1.0)
+            ordinal_targets = torch.nan_to_num(ordinal_targets, nan=0.0, posinf=1.0, neginf=0.0)
+            ordinal_targets = torch.clamp(ordinal_targets, min=0.0, max=1.0)
             loss = criterion(ordinal_probs, ordinal_targets)
             output = _ordinal_to_class_probs(ordinal_probs)
 
@@ -238,8 +242,17 @@ def train_with_config(args, opts):
     mil_out_dim = fused_dim * opts.mil_branches
     ordinal_head = OrdinalHead(in_dim=mil_out_dim, num_tiers=args.action_classes)
     criterion = OrdinalCrossEntropyLoss(num_tiers=args.action_classes)
+    use_data_parallel = False
     if torch.cuda.is_available():
-        model = nn.DataParallel(model)
+        gpu_count = torch.cuda.device_count()
+        if gpu_count > 1 and args.batch_size >= (2 * gpu_count):
+            model = nn.DataParallel(model)
+            use_data_parallel = True
+        elif gpu_count > 1:
+            print(
+                f'INFO: DataParallel disabled because batch_size={args.batch_size} '
+                f'is too small for {gpu_count} GPUs (requires >= {2 * gpu_count} for BatchNorm stability).'
+            )
         model = model.cuda()
         attention_mil = attention_mil.cuda()
         ordinal_head = ordinal_head.cuda()
@@ -310,9 +323,10 @@ def train_with_config(args, opts):
             print('WARNING: Found fusion_head in checkpoint. Skipping load because current run expects ordinal_head.')
     
     if not opts.evaluate:
+        model_for_optim = model.module if use_data_parallel else model
         optimizer = optim.AdamW(
-            [     {"params": filter(lambda p: p.requires_grad, model.module.backbone.parameters()), "lr": args.lr_backbone},
-                  {"params": filter(lambda p: p.requires_grad, model.module.head.parameters()), "lr": args.lr_head},
+            [     {"params": filter(lambda p: p.requires_grad, model_for_optim.backbone.parameters()), "lr": args.lr_backbone},
+                  {"params": filter(lambda p: p.requires_grad, model_for_optim.head.parameters()), "lr": args.lr_head},
                                 {"params": filter(lambda p: p.requires_grad, attention_mil.parameters()), "lr": args.lr_head},
                 {"params": filter(lambda p: p.requires_grad, ordinal_head.parameters()), "lr": args.lr_head},
             ],      lr=args.lr_backbone, 
@@ -362,6 +376,10 @@ def train_with_config(args, opts):
                 bag_feat = attention_mil(fusion_feat)
                 ordinal_probs = ordinal_head(bag_feat)
                 ordinal_targets = labels_to_ordinal(batch_gt.long(), num_tiers=args.action_classes)
+                ordinal_probs = torch.nan_to_num(ordinal_probs, nan=0.5, posinf=1.0, neginf=0.0)
+                ordinal_probs = torch.clamp(ordinal_probs, min=0.0, max=1.0)
+                ordinal_targets = torch.nan_to_num(ordinal_targets, nan=0.0, posinf=1.0, neginf=0.0)
+                ordinal_targets = torch.clamp(ordinal_targets, min=0.0, max=1.0)
                 output = _ordinal_to_class_probs(ordinal_probs)
                 optimizer.zero_grad()
                 loss_train = criterion(ordinal_probs, ordinal_targets)

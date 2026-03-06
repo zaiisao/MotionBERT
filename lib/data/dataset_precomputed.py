@@ -57,7 +57,16 @@ class PrecomputedWHAMFolderDataset(Dataset):
             if os.path.isabs(root_dir_cfg):
                 root_dir = root_dir_cfg
             elif datasets_root:
-                root_dir = os.path.join(datasets_root, root_dir_cfg)
+                joined_root = os.path.join(datasets_root, root_dir_cfg)
+                if os.path.isdir(joined_root):
+                    root_dir = joined_root
+                else:
+                    datasets_root_norm = os.path.normpath(datasets_root)
+                    root_cfg_norm = os.path.normpath(root_dir_cfg)
+                    if os.path.basename(datasets_root_norm) == root_cfg_norm and os.path.isdir(datasets_root_norm):
+                        root_dir = datasets_root_norm
+                    else:
+                        root_dir = joined_root
             else:
                 root_dir = root_dir_cfg
             label_tier = int(cfg['label_tier'])
@@ -147,6 +156,7 @@ class PrecomputedWHAMFolderDataset(Dataset):
 
         if self.scale_range is not None:
             motion = crop_scale_3d(motion, scale_range=self.scale_range)
+        motion = np.nan_to_num(motion, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
         if joint_count < self.num_joints:
             pad = np.zeros((motion.shape[0], self.num_joints - joint_count, 3), dtype=np.float32)
